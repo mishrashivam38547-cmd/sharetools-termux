@@ -1,0 +1,248 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+APP_DIR="$HOME/.sharetools"
+CONFIG="$APP_DIR/config"
+TOKEN="$APP_DIR/token.json"
+WORKER_URL_DEFAULT="https://white-frog-d43f.shivamishra55389.workers.dev"
+mkdir -p "$APP_DIR"
+chmod 700 "$APP_DIR"
+
+say(){ printf '%s\n' "$*"; }
+die(){ say "Error: $*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "'$1' install karo: pkg install $1"; }
+need curl
+need python
+
+init(){
+  if [ ! -f "$CONFIG" ]; then
+    say "=== ShareTools setup ==="
+    printf "Firebase Web API key: "
+    read -r API_KEY
+    [ -n "$API_KEY" ] || die "API key required."
+    printf "Worker URL [%s]: " "$WORKER_URL_DEFAULT"
+    read -r WORKER_URL
+    WORKER_URL="${WORKER_URL:-$WORKER_URL_DEFAULT}"
+    cat > "$CONFIG" <<CFG
+API_KEY=$(printf '%s' "$API_KEY" | tr -d '\r\n')
+WORKER_URL=$(printf '%s' "$WORKER_URL" | tr -d '\r\n')
+CFG
+    chmod 600 "$CONFIG"
+  fi
+  # shellcheck disable=SC1090
+  . "$CONFIG"
+  [ -n "${API_KEY:-}" ] || die "API_KEY missing in $CONFIG"
+  [ -n "${WORKER_URL:-}" ] || die "WORKER_URL missing in $CONFIG"
+}
+
+json_get(){ python - "$1" "$2" <<'PY'
+import json,sys
+p=sys.argv[1]; key=sys.argv[2]
+try:
+    d=json.load(open(p))
+    v=d
+    for x in key.split('.'):
+        v=v[x]
+    print(v if v is not None else '')
+except Exception:
+    print('')
+PY
+}
+
+login(){
+  init
+  printf "Email: "
+  read -r EMAIL
+  printf "Password: "
+  read -rs PASS; echo
+  RESP="$APP_DIR/login.json"
+  curl -fsS -X POST "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=$API_KEY" \
+    -H 'Content-Type: application/json' \
+    -d "$(python - "$EMAIL" "$PASS" <<'PY'
+import json,sys
+print(json.dumps({'email':sys.argv[1],'password':sys.argv[2],'returnSecureToken':True}))
+PY
+)" > "$RESP" || die "Login failed. Email/password check karo."
+  if ! python - "$RESP" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1]))
+if 'idToken' not in x:
+    print(x.get('error',{}).get('message','Login failed'))
+    raise SystemExit(1)
+PY
+  then
+    rm -f "$RESP"; die "Firebase login failed."
+  fi
+  mv "$RESP" "$TOKEN"
+  chmod 600 "$TOKEN"
+  say "Login successful."
+}
+
+refresh(){
+  init
+  [ -f "$TOKEN" ] || die "Pehle: sharetools login"
+  RT=$(json_get "$TOKEN" refreshToken)
+  [ -n "$RT" ] || die "Refresh token missing. Dobara login karo."
+  R="$APP_DIR/refresh.json"
+  curl -fsS -X POST "https://securetoken.googleapis.com/v1/token?key=$API_KEY" \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    --data-urlencode "grant_type=refresh_token" \
+    --data-urlencode "refresh_token=$RT" > "$R" || die "Token refresh failed. Dobara login karo."
+  NEW=$(python - "$R" "$RT" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1])); rt=x.get('refresh_token') or sys.argv[2]
+if not x.get('id_token'): raise SystemExit(1)
+print(json.dumps({'idToken':x['id_token'],'refreshToken':rt,'expiresIn':x.get('expires_in','3600')}))
+PY
+) || { rm -f "$R"; die "Session expired. sharetools login"; }
+  printf '%s' "$NEW" > "$TOKEN"
+  chmod 600 "$TOKEN"
+  rm -f "$R"
+}
+
+api(){
+  local ACTION="$1"; shift
+  refresh >/dev/null
+  local IDT
+  IDT=$(json_get "$TOKEN" idToken)
+  curl -fsS -X POST "$WORKER_URL" -H 'Content-Type: application/json' -H "Authorization: Bearer $IDT" \
+    -d "$(python - "$ACTION" "$*" <<'PY'
+import json,sys
+print(json.dumps({'action':sys.argv[1]}))
+PY
+)"
+}
+
+api_json(){
+  local ACTION="$1"; local PAYLOAD="$2"
+  refresh >/dev/null
+  local IDT
+  IDT=$(json_get "$TOKEN" idToken)
+  curl -fsS -X POST "$WORKER_URL" -H 'Content-Type: application/json' -H "Authorization: Bearer $IDT" -d "$PAYLOAD"
+}
+
+config(){
+  init
+  R=$(api getShareToolsConfig) || die "Worker request failed."
+  python - "$R" <<'PY'
+import json,sys
+x=json.loads(sys.argv[1])
+if x.get('error'): raise SystemExit(x['error'])
+print('Sponsor: '+str(x.get('title','Sponsored')))
+print('Text: '+str(x.get('text','')))
+print('Link: '+str(x.get('link','')))
+print('Enabled: '+str(x.get('enabled',False)))
+PY
+}
+
+sponsor(){
+  init
+  R=$(api startShareToolsSession) || die "Sponsor session start failed."
+  SID=$(python - "$R" <<'PY'
+import json,sys
+x=json.loads(sys.argv[1])
+if x.get('error'): raise SystemExit(x['error'])
+print(x.get('sessionId',''))
+PY
+) || die "Sponsor unavailable."
+  TITLE=$(python - "$R" <<'PY'
+import json,sys
+x=json.loads(sys.argv[1]); print(x.get('sponsor',{}).get('title','Sponsored'))
+PY
+)
+  TEXT=$(python - "$R" <<'PY'
+import json,sys
+x=json.loads(sys.argv[1]); print(x.get('sponsor',{}).get('text',''))
+PY
+)
+  LINK=$(python - "$R" <<'PY'
+import json,sys
+x=json.loads(sys.argv[1]); print(x.get('sponsor',{}).get('link',''))
+PY
+)
+  WAIT=$(python - "$R" <<'PY'
+import json,sys
+x=json.loads(sys.argv[1]); print(int(x.get('minExposureMs',15000))/1000)
+PY
+)
+  printf '\n===== SPONSORED =====\n%s\n%s\n' "$TITLE" "$TEXT"
+  [ -z "$LINK" ] || printf 'Sponsor link: %s\n' "$LINK"
+  printf '\n15-second exposure required for a valid sponsor impression.\n'
+  printf 'Open sponsor link? [y/N]: '
+  read -r OPEN
+  if [[ "$OPEN" =~ ^[Yy]$ ]] && [ -n "$LINK" ]; then
+    if command -v termux-open-url >/dev/null 2>&1; then termux-open-url "$LINK"; else say "Open manually: $LINK"; fi
+  fi
+  START=$(date +%s)
+  while true; do
+    NOW=$(date +%s); EL=$((NOW-START)); REM=$((15-EL));
+    if [ "$REM" -le 0 ]; then break; fi
+    printf '\rSponsor exposure: %2ss remaining ' "$REM"
+    sleep 1
+  done
+  printf '\n'
+  PAY=$(python - "$SID" <<'PY'
+import json,sys
+print(json.dumps({'action':'completeShareToolsImpression','sessionId':sys.argv[1]}))
+PY
+)
+  C=$(api_json completeShareToolsImpression "$PAY") || die "Impression submit failed."
+  python - "$C" <<'PY'
+import json,sys
+x=json.loads(sys.argv[1])
+if x.get('counted'): print('✓ Valid sponsor impression counted.')
+elif x.get('error'): print('Not counted: '+x['error'])
+PY
+}
+
+stats(){
+  R=$(api getShareToolsStats) || die "Stats request failed."
+  python - "$R" <<'PY'
+import json,sys
+x=json.loads(sys.argv[1])
+if x.get('error'): raise SystemExit(x['error'])
+print('Total sponsor views :',x.get('total',0))
+print('This month          :',x.get('month',0))
+print('Today               :',x.get('today',0))
+PY
+}
+
+run_cmd(){
+  [ "$#" -gt 0 ] || die "Usage: sharetools run <command>"
+  sponsor
+  say ""
+  say "Running command: $*"
+  bash -lc "$*"
+}
+
+help(){ cat <<'TXT'
+ShareTools — PlayVault Termux client
+
+Commands:
+  sharetools setup             Configure Firebase API key + Worker URL
+  sharetools login             Login with your PlayVault account
+  sharetools config            Show current sponsor campaign
+  sharetools sponsor           View sponsor and record a genuine impression
+  sharetools stats             Show your sponsor-view stats
+  sharetools run <command>     Sponsor exposure, then run your command
+  sharetools logout            Remove local login token
+  sharetools help              Show help
+
+Example:
+  sharetools login
+  sharetools sponsor
+  sharetools run python hello.py
+TXT
+}
+
+case "${1:-help}" in
+  setup) init ;;
+  login) login ;;
+  config) config ;;
+  sponsor) sponsor ;;
+  stats) stats ;;
+  run) shift; run_cmd "$@" ;;
+  logout) rm -f "$TOKEN"; say "Logged out." ;;
+  help|-h|--help) help ;;
+  *) help; exit 1 ;;
+esac
